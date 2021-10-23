@@ -2,11 +2,9 @@ from gym import make
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import functional as F
 from torch.optim import Adam
 from collections import deque
 import random
-import copy
 
 from network import NN_CATALOG
 

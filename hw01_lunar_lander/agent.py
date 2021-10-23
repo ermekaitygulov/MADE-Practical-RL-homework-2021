@@ -1,12 +1,13 @@
-import random
 import numpy as np
-import os
 import torch
+from network import NN_CATALOG
 
 
 class Agent:
     def __init__(self):
-        self.model = torch.load(__file__[:-8] + "/agent.pkl").cpu()
+        self.model = NN_CATALOG['DuelingDQN'](8, 4)
+        model_weight = torch.load(__file__[:-8] + "/agent_weight.pkl")
+        self.model.load_state_dict(model_weight)
         
     def act(self, state):
         # Compute an action. Do not forget to turn state to a Tensor and then turn an action to a numpy array.
