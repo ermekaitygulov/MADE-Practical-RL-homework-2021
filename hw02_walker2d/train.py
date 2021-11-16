@@ -1,3 +1,5 @@
+from collections import defaultdict
+
 import pybullet_envs
 # Don't forget to install PyBullet!
 from gym import make
@@ -7,6 +9,7 @@ from torch import nn
 from torch.distributions import Normal
 from torch.nn import functional as F
 from torch.optim import Adam
+import wandb
 import random
 
 ENV_NAME = "Walker2DBulletEnv-v0"
@@ -17,7 +20,7 @@ GAMMA = 0.99
 ACTOR_LR = 2e-4
 CRITIC_LR = 1e-4
 
-CLIP = 0.2
+CLIP = 0.1
 ENTROPY_COEF = 1e-2
 BATCHES_PER_UPDATE = 64
 BATCH_SIZE = 64
@@ -25,7 +28,23 @@ BATCH_SIZE = 64
 MIN_TRANSITIONS_PER_UPDATE = 2048
 MIN_EPISODES_PER_UPDATE = 4
 
+KL_MAX = 100
 ITERATIONS = 1000
+
+CONFIG = dict(
+    LAMBDA = 0.95,
+    GAMMA = 0.99,
+    ACTOR_LR = 2e-4,
+    CRITIC_LR = 1e-3,
+    CLIP = 0.2,
+    ENTROPY_COEF = 1e-2,
+    BATCHES_PER_UPDATE = 64,
+    BATCH_SIZE = 64,
+    MIN_TRANSITIONS_PER_UPDATE = 2048,
+    MIN_EPISODES_PER_UPDATE = 4,
+    ITERATIONS = 1000,
+    KL_MAX=1
+)
 
     
 def compute_lambda_returns_and_gae(trajectory):
@@ -41,17 +60,22 @@ def compute_lambda_returns_and_gae(trajectory):
         gae.append(last_lr - v)
     
     # Each transition contains state, action, old action probability, value estimation and advantage estimation
-    return [(s, a, p, v, adv) for (s, a, _, p, _), v, adv in zip(trajectory, reversed(lambda_returns), reversed(gae))]
+    return [(s, a, p, v, adv, v_old) for (s, a, _, p, v_old), v, adv in zip(trajectory, reversed(lambda_returns), reversed(gae))]
     
-
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
         super().__init__()
         # Advice: use same log_sigma for all states to improve stability
         # You can do this by defining log_sigma as nn.Parameter(torch.zeros(...))
-        self.model = None
-        self.sigma = None
+        self.model = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.Tanh(),
+            nn.Linear(256, 256),
+            nn.Tanh(),
+            nn.Linear(256, action_dim)
+        )
+        self.sigma = nn.Parameter(torch.ones(1, action_dim) * -0.5)
         
     def compute_proba(self, state, action):
         # Returns probability of action according to current policy and distribution of actions
@@ -60,7 +84,11 @@ class Actor(nn.Module):
     def act(self, state):
         # Returns an action (with tanh), not-transformed action (without tanh) and distribution of non-transformed actions
         # Remember: agent is not deterministic, sample actions from distribution (e.g. Gaussian)
-        return None
+        action_mean = self.model(state)
+        action_distr = Normal(action_mean, torch.exp(self.sigma))
+        raw_action = action_distr.sample()
+        action = F.tanh(raw_action)
+        return action, raw_action, action_distr
         
         
 class Critic(nn.Module):
@@ -68,9 +96,9 @@ class Critic(nn.Module):
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(state_dim, 256),
-            nn.ELU(),
+            nn.ReLU(),
             nn.Linear(256, 256),
-            nn.ELU(),
+            nn.ReLU(),
             nn.Linear(256, 1)
         )
         
@@ -80,49 +108,94 @@ class Critic(nn.Module):
 
 class PPO:
     def __init__(self, state_dim, action_dim):
-        self.actor = Actor(state_dim, action_dim)
-        self.critic = Critic(state_dim)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.actor = Actor(state_dim, action_dim).to(self.device)
+        self.critic = Critic(state_dim).to(self.device)
         self.actor_optim = Adam(self.actor.parameters(), ACTOR_LR)
         self.critic_optim = Adam(self.critic.parameters(), CRITIC_LR)
 
-    def update(self, trajectories):
+    def update(self, trajectories, steps_done):
         transitions = [t for traj in trajectories for t in traj] # Turn a list of trajectories into list of transitions
-        state, action, old_prob, target_value, advantage = zip(*transitions)
+        state, action, old_prob, target_value, advantage, value_old = zip(*transitions)
         state = np.array(state)
         action = np.array(action)
         old_prob = np.array(old_prob)
         target_value = np.array(target_value)
+        value_old = np.array(value_old)
         advantage = np.array(advantage)
-        advnatage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
-        
+        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        log_dict = defaultdict(list)
         
         for _ in range(BATCHES_PER_UPDATE):
             idx = np.random.randint(0, len(transitions), BATCH_SIZE) # Choose random batch
-            s = torch.tensor(state[idx]).float()
-            a = torch.tensor(action[idx]).float()
-            op = torch.tensor(old_prob[idx]).float() # Probability of the action in state s.t. old policy
-            v = torch.tensor(target_value[idx]).float() # Estimated by lambda-returns 
-            adv = torch.tensor(advantage[idx]).float() # Estimated by generalized advantage estimation 
-            
-            # TODO: Update actor here            
+            s = torch.tensor(state[idx]).float().to(self.device)
+            a = torch.tensor(action[idx]).float().to(self.device)
+            op = torch.tensor(old_prob[idx]).float().to(self.device) # Probability of the action in state s.t. old policy
+            v = torch.tensor(target_value[idx]).float().to(self.device) # Estimated by lambda-returns
+            v_old = torch.tensor(value_old[idx]).float().to(self.device)
+            adv = torch.tensor(advantage[idx]).float().to(self.device) # Estimated by generalized advantage estimation
+            _, _, policy = self.actor.act(s)
+            value = self.critic.get_value(s).squeeze()
+            # value = v_old + (value - v_old).clamp(-CLIP, CLIP)
+
+            p = policy.log_prob(a).sum(-1)
+            p_odds = torch.exp(p - op)
+            g = torch.where(adv >= 0, 1 + CLIP, 1 - CLIP)
+            policy_gain = torch.minimum(p_odds * adv, g * adv).mean()
+            entropy = policy.entropy().mean()
+            actor_loss = - policy_gain - entropy * ENTROPY_COEF
+
+            val_loss = F.mse_loss(value.squeeze(), v)
+            critic_loss = val_loss
+
+            # TODO: Update actor here
+            log_dict['kl_div'].append(F.kl_div(p, op, log_target=True).cpu().item())
+            if log_dict['kl_div'][-1] > KL_MAX:
+                break
+            log_dict['actor_grad'].append(self.update_nn(self.actor_optim, actor_loss, self.actor))
+            log_dict['critic_grad'].append(self.update_nn(self.critic_optim, critic_loss, self.critic))
+
+            log_dict['policy_gain'].append(policy_gain.cpu().item())
+            log_dict['entropy'].append(entropy.cpu().item())
+            log_dict['val_loss'].append(val_loss.cpu().item())
+
             # TODO: Update critic here
-            
+        if wandb.run:
+            wandb.log({'step': steps_done, **{key: np.mean(value) for key, value in log_dict.items()}})
+        else:
+            print(f'{key}: {np.mean(value):.3f}' for key, value in log_dict.items())
+
+    @staticmethod
+    def update_nn(optim, loss, model):
+        optim.zero_grad()
+        loss.backward()
+        for param in model.parameters():
+            param.grad.data.clamp_(-1, 1)
+
+        optim.step()
+
+        total_norm = 0.0
+        for p in model.parameters():
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        return total_norm
             
     def get_value(self, state):
         with torch.no_grad():
-            state = torch.tensor(np.array([state])).float()
+            state = torch.tensor(np.array([state])).float().to(self.device)
             value = self.critic.get_value(state)
         return value.cpu().item()
 
     def act(self, state):
         with torch.no_grad():
-            state = torch.tensor(np.array([state])).float()
+            state = torch.tensor(np.array([state])).float().to(self.device)
             action, pure_action, distr = self.actor.act(state)
-            prob = torch.exp(distr.log_prob(pure_action).sum(-1))
+            prob = distr.log_prob(pure_action).sum(-1)
         return action.cpu().numpy()[0], pure_action.cpu().numpy()[0], prob.cpu().item()
 
-    def save(self):
-        torch.save(self.actor, "agent.pkl")
+    def save(self, reward):
+        torch.save(self.actor.state_dict(), f"agent_{reward:.2f}.pkl")
 
 
 def evaluate_policy(env, agent, episodes=5):
@@ -151,7 +224,19 @@ def sample_episode(env, agent):
         s = ns
     return compute_lambda_returns_and_gae(trajectory)
 
+
 if __name__ == "__main__":
+    try:
+        wandb.init(
+            entity='ermekaitygulov',
+            anonymous='allow',
+            project='RL-HW2',
+            force=False,
+            config=CONFIG
+        )
+    except wandb.errors.error.UsageError:
+        pass
+
     env = make(ENV_NAME)
     ppo = PPO(state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0])
     state = env.reset()
@@ -169,9 +254,10 @@ if __name__ == "__main__":
         episodes_sampled += len(trajectories)
         steps_sampled += steps_ctn
 
-        ppo.update(trajectories)        
+        ppo.update(trajectories, steps_sampled)
         
         if (i + 1) % (ITERATIONS//100) == 0:
             rewards = evaluate_policy(env, ppo, 5)
             print(f"Step: {i+1}, Reward mean: {np.mean(rewards)}, Reward std: {np.std(rewards)}, Episodes: {episodes_sampled}, Steps: {steps_sampled}")
-            ppo.save()
+            if np.mean(rewards) > 500:
+                ppo.save(np.mean(rewards))
