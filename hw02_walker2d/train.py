@@ -12,38 +12,44 @@ from torch.optim import Adam
 import wandb
 import random
 
+from util import WalkerRewardShape
+
 ENV_NAME = "Walker2DBulletEnv-v0"
 
 LAMBDA = 0.95
 GAMMA = 0.99
 
 ACTOR_LR = 2e-4
-CRITIC_LR = 1e-4
+CRITIC_LR = 1e-3
 
-CLIP = 0.1
+CLIP = 0.2
 ENTROPY_COEF = 1e-2
 BATCHES_PER_UPDATE = 64
 BATCH_SIZE = 64
 
-MIN_TRANSITIONS_PER_UPDATE = 2048
-MIN_EPISODES_PER_UPDATE = 4
-
-KL_MAX = 100
+MIN_TRANSITIONS_PER_UPDATE = 4096 #2048
+MIN_EPISODES_PER_UPDATE = 10 #4
 ITERATIONS = 1000
 
+KL_MAX = 1
+LOAD_FROM = {
+    'actor_path': 'actor_660.55.pkl',
+    'critic_path': 'critic_660.55.pkl',
+}
+
 CONFIG = dict(
-    LAMBDA = 0.95,
-    GAMMA = 0.99,
-    ACTOR_LR = 2e-4,
-    CRITIC_LR = 1e-3,
-    CLIP = 0.2,
-    ENTROPY_COEF = 1e-2,
-    BATCHES_PER_UPDATE = 64,
-    BATCH_SIZE = 64,
-    MIN_TRANSITIONS_PER_UPDATE = 2048,
-    MIN_EPISODES_PER_UPDATE = 4,
-    ITERATIONS = 1000,
-    KL_MAX=1
+    LAMBDA=LAMBDA,
+    GAMMA=GAMMA,
+    ACTOR_LR=ACTOR_LR,
+    CRITIC_LR=CRITIC_LR,
+    CLIP=CLIP,
+    ENTROPY_COEF=ENTROPY_COEF,
+    BATCHES_PER_UPDATE=BATCHES_PER_UPDATE,
+    BATCH_SIZE=BATCH_SIZE,
+    MIN_TRANSITIONS_PER_UPDATE=MIN_TRANSITIONS_PER_UPDATE,
+    MIN_EPISODES_PER_UPDATE=MIN_EPISODES_PER_UPDATE,
+    ITERATIONS=ITERATIONS,
+    KL_MAX=KL_MAX
 )
 
     
@@ -112,7 +118,7 @@ class PPO:
         self.actor = Actor(state_dim, action_dim).to(self.device)
         self.critic = Critic(state_dim).to(self.device)
         self.actor_optim = Adam(self.actor.parameters(), ACTOR_LR)
-        self.critic_optim = Adam(self.critic.parameters(), CRITIC_LR)
+        self.critic_optim = Adam(self.critic.parameters(), CRITIC_LR, weight_decay=1e-5)
 
     def update(self, trajectories, steps_done):
         transitions = [t for traj in trajectories for t in traj] # Turn a list of trajectories into list of transitions
@@ -195,7 +201,17 @@ class PPO:
         return action.cpu().numpy()[0], pure_action.cpu().numpy()[0], prob.cpu().item()
 
     def save(self, reward):
-        torch.save(self.actor.state_dict(), f"agent_{reward:.2f}.pkl")
+        torch.save(self.actor.state_dict(), f"actor_{reward:.2f}.pkl")
+        torch.save(self.critic.state_dict(), f"critic_{reward:.2f}.pkl")
+
+    def load(self, actor_path, critic_path):
+        if actor_path:
+            actor_weight = torch.load(actor_path, map_location=self.device)
+            self.actor.load_state_dict(actor_weight)
+
+        if critic_path:
+            critic_weight = torch.load(critic_path, map_location=self.device)
+            self.critic.load_state_dict(critic_weight)
 
 
 def evaluate_policy(env, agent, episodes=5):
@@ -238,7 +254,9 @@ if __name__ == "__main__":
         pass
 
     env = make(ENV_NAME)
+    train_env = WalkerRewardShape(env)
     ppo = PPO(state_dim=env.observation_space.shape[0], action_dim=env.action_space.shape[0])
+    ppo.load(**LOAD_FROM)
     state = env.reset()
     episodes_sampled = 0
     steps_sampled = 0
@@ -248,7 +266,7 @@ if __name__ == "__main__":
         steps_ctn = 0
         
         while len(trajectories) < MIN_EPISODES_PER_UPDATE or steps_ctn < MIN_TRANSITIONS_PER_UPDATE:
-            traj = sample_episode(env, ppo)
+            traj = sample_episode(train_env, ppo)
             steps_ctn += len(traj)
             trajectories.append(traj)
         episodes_sampled += len(trajectories)
