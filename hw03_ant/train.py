@@ -13,14 +13,19 @@ GAMMA = 0.99
 TAU = 0.002
 CRITIC_LR = 5e-4
 ACTOR_LR = 2e-4
-DEVICE = "cuda"
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 BATCH_SIZE = 128
 ENV_NAME = "AntBulletEnv-v0"
 TRANSITIONS = 1000000
+DELAY = 2
+POLICY_NOISE = 0.02
+NOISE_CLIP = 0.05
+
 
 def soft_update(target, source):
     for tp, sp in zip(target.parameters(), source.parameters()):
         tp.data.copy_((1 - TAU) * tp.data + TAU * sp.data)
+
 
 class Actor(nn.Module):
     def __init__(self, state_dim, action_dim):
@@ -66,13 +71,14 @@ class TD3:
         self.target_actor = copy.deepcopy(self.actor)
         self.target_critic_1 = copy.deepcopy(self.critic_1)
         self.target_critic_2 = copy.deepcopy(self.critic_2)
-        
+
+        self.total_it = 0
         self.replay_buffer = deque(maxlen=200000)
 
     def update(self, transition):
         self.replay_buffer.append(transition)
         if len(self.replay_buffer) > BATCH_SIZE * 16:
-            
+            self.total_it += 1
             # Sample batch
             transitions = [self.replay_buffer[random.randint(0, len(self.replay_buffer)-1)] for _ in range(BATCH_SIZE)]
             state, action, next_state, reward, done = zip(*transitions)
@@ -83,20 +89,84 @@ class TD3:
             done = torch.tensor(np.array(done), device=DEVICE, dtype=torch.float)
             
             # Update critic
+            self.update_critic(state, action, reward, next_state, done)
             
             # Update actor
-            
-            soft_update(self.target_critic_1, self.critic_1)
-            soft_update(self.target_critic_2, self.critic_2)
-            soft_update(self.target_actor, self.actor)
+            if (self.total_it % DELAY) == 0:
+                self.update_actor(state)
+
+                soft_update(self.target_critic_1, self.critic_1)
+                soft_update(self.target_critic_2, self.critic_2)
+                soft_update(self.target_actor, self.actor)
+
+    def update_critic(self, state, action, reward, next_state, done):
+        q_1 = self.critic_1(state, action)
+        q_2 = self.critic_2(state, action)
+        with torch.no_grad():
+            next_action = self.target_actor(next_state)
+            noise = (
+                    torch.randn_like(action) * POLICY_NOISE
+            ).clamp(-NOISE_CLIP, NOISE_CLIP)
+            next_action = (next_action + noise).clamp(-1, 1)
+
+            next_q_1 = self.target_critic_1(next_state, next_action)
+            next_q_2 = self.target_critic_2(next_state, next_action)
+
+            target = torch.minimum(next_q_1, next_q_2) * GAMMA
+            target = target * (1 - done)
+            target += reward
+
+        critic_loss1 = F.mse_loss(q_1, target)
+        critic_loss2 = F.mse_loss(q_2, target)
+
+        critic1_grad = self.update_nn(self.critic_1_optim, critic_loss1, self.critic_1)
+        critic2_grad = self.update_nn(self.critic_2_optim, critic_loss2, self.critic_2)
+
+    def update_actor(self, state):
+        pred_action = self.actor(state)
+        q_value = self.critic_1(state, pred_action)
+        q_mean = -torch.mean(q_value)
+        actor_loss = q_mean
+
+        actor_grad = self.update_nn(self.actor_optim, actor_loss, self.actor)
+
+    @staticmethod
+    def update_nn(optim, loss, model):
+        optim.zero_grad()
+        loss.backward()
+        for param in model.parameters():
+            param.grad.data.clamp_(-1, 1)
+
+        optim.step()
+
+        total_norm = 0.0
+        for p in model.parameters():
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        return total_norm
 
     def act(self, state):
         with torch.no_grad():
             state = torch.tensor(np.array([state]), dtype=torch.float, device=DEVICE)
             return self.actor(state).cpu().numpy()[0]
 
-    def save(self):
-        torch.save(self.actor, "agent.pkl")
+    def save(self, reward):
+        torch.save(self.actor.state_dict(), f"actor_{reward:.2f}.pkl")
+        torch.save(self.critic_1.state_dict(), f"critic_{reward:.2f}.pkl")
+
+    def load(self, actor_path, critic_path):
+        if actor_path:
+            actor_weight = torch.load(actor_path, map_location=DEVICE)
+            self.actor.load_state_dict(actor_weight)
+
+        if critic_path:
+            critic_weight = torch.load(critic_path, map_location=DEVICE)
+            self.critic_1.load_state_dict(critic_weight)
+            self.critic_2.load_state_dict(critic_weight)
+
+            self.target_critic_1 = copy.deepcopy(self.critic_1)
+            self.target_critic_2 = copy.deepcopy(self.critic_2)
 
 
 def evaluate_policy(env, agent, episodes=5):
@@ -112,6 +182,7 @@ def evaluate_policy(env, agent, episodes=5):
         returns.append(total_reward)
     return returns
 
+
 if __name__ == "__main__":
     env = make(ENV_NAME)
     test_env = make(ENV_NAME)
@@ -120,6 +191,7 @@ if __name__ == "__main__":
     episodes_sampled = 0
     steps_sampled = 0
     eps = 0.2
+    max_reward = -np.inf
     
     for i in range(TRANSITIONS):
         steps = 0
@@ -136,4 +208,5 @@ if __name__ == "__main__":
         if (i + 1) % (TRANSITIONS//100) == 0:
             rewards = evaluate_policy(test_env, td3, 5)
             print(f"Step: {i+1}, Reward mean: {np.mean(rewards)}, Reward std: {np.std(rewards)}")
-            td3.save()
+            if np.mean(rewards) > max_reward:
+                td3.save(np.mean(rewards))
