@@ -245,4 +245,5 @@ if __name__ == "__main__":
             wandb.log({'train_step': i + 1, 'val': np.mean(rewards)})
             if np.mean(rewards) > max_reward:
                 td3.save(np.mean(rewards))
+                max_reward = np.mean(rewards)
 

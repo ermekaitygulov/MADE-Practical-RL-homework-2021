@@ -11,7 +11,7 @@ except ModuleNotFoundError:
 class Agent:
     def __init__(self):
         self.model = Actor(28, 8)
-        model_weight = torch.load(__file__[:-8] + "/actor_3081.85.pkl", map_location='cpu')
+        model_weight = torch.load(__file__[:-8] + "/actor_3254.15.pkl", map_location='cpu')
         self.model.load_state_dict(model_weight)
 
     def act(self, state):
