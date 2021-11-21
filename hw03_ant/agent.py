@@ -2,15 +2,23 @@ import random
 import numpy as np
 import os
 import torch
+try:
+    from train import Actor
+except ModuleNotFoundError:
+    from .train import Actor
 
 
 class Agent:
     def __init__(self):
-        self.model = torch.load(__file__[:-8] + "/agent.pkl")
-        
+        self.model = Actor(28, 8)
+        model_weight = torch.load(__file__[:-8] + "/actor_3081.85.pkl", map_location='cpu')
+        self.model.load_state_dict(model_weight)
+
     def act(self, state):
-        state = torch.tensor(np.array(state))
-        return 0 # TODO
+        with torch.no_grad():
+            state = torch.tensor(np.array(state)).float()
+            action = self.model(state)
+        return action.cpu().numpy()
 
     def reset(self):
         pass
